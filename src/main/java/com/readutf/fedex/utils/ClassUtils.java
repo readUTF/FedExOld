@@ -1,46 +1,75 @@
 package com.readutf.fedex.utils;
 
-import com.readutf.fedex.FedEx;
+import lombok.experimental.UtilityClass;
 
-import java.io.File;
 import java.io.IOException;
 import java.net.URL;
-import java.net.URLClassLoader;
+import java.security.CodeSource;
 import java.util.ArrayList;
+import java.util.Collection;
+import java.util.Collections;
 import java.util.Enumeration;
-import java.util.List;
 import java.util.jar.JarEntry;
 import java.util.jar.JarFile;
-import java.util.logging.Level;
-import java.util.logging.Logger;
 
-public class ClassUtils {
+@UtilityClass
+public final class ClassUtils {
+    /**
+     * Gets all the classes in a the provided package.
+     *
+     * @param packageName The package to scan classes in.
+     * @return The classes in the package packageName.
+     */
+    //TODO: Make this not require a Plugin object.
+    public static Collection<Class<?>> getClassesInPackage(Class<?> clazz1, String packageName) {
+        Collection<Class<?>> classes = new ArrayList<>();
 
-    public static List<Class<?>> getClasses(String jarLocation, String pathToPackage) throws Exception {
-        List<Class<?>> classes = new ArrayList<>();
+        CodeSource codeSource = clazz1.getProtectionDomain().getCodeSource();
+        URL resource = codeSource.getLocation();
+        String relPath = packageName.replace('.', '/');
+        String resPath = resource.getPath().replace("%20", " ");
+        String jarPath = resPath.replaceFirst("[.]jar[!].*", ".jar").replaceFirst("file:", "");
+        JarFile jarFile;
 
-        URL jarUrl = new URL("file://" + jarLocation);
-        URLClassLoader loader = new URLClassLoader(new URL[]{jarUrl}, FedEx.class.getClassLoader());
-        JarFile jar = new JarFile(jarLocation);
+        try {
+            jarFile = new JarFile(jarPath);
+        } catch (IOException e) {
+            throw (new RuntimeException("Unexpected IOException reading JAR File '" + jarPath + "'", e));
+        }
 
-        for (Enumeration<JarEntry> entries = jar.entries(); entries.hasMoreElements(); ) {
+        Enumeration<JarEntry> entries = jarFile.entries();
+
+        while (entries.hasMoreElements()) {
             JarEntry entry = entries.nextElement();
-            String file = entry.getName();
-            if (file.endsWith(".class") && file.startsWith(pathToPackage.replaceAll("\\.", "/"))) {
-                String classname =
-                        file.replace('/', '.').substring(0, file.length() - 6).split("\\$")[0];
+            String entryName = entry.getName();
+            String className = null;
+
+            if (entryName.endsWith(".class") && entryName.startsWith(relPath) && entryName.length() > (relPath.length() + "/".length())) {
+                className = entryName.replace('/', '.').replace('\\', '.').replace(".class", "");
+            }
+
+            if (className != null) {
+                Class<?> clazz = null;
+
                 try {
-                    Class<?> c = loader.loadClass(classname);
-                    classes.add(c);
-                } catch (Throwable e) {
-                    Logger.getLogger(ClassUtils.class.getName()).log(Level.WARNING, "Failed to instantiate " + classname + " from " + file + ".");
+                    clazz = Class.forName(className);
+                } catch (ClassNotFoundException e) {
                     e.printStackTrace();
+                }
+
+                if (clazz != null) {
+                    classes.add(clazz);
                 }
             }
         }
-        jar.close();
+
+        try {
+            jarFile.close();
+        } catch (IOException e) {
+            e.printStackTrace();
+        }
+
         return classes;
     }
-
 
 }

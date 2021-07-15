@@ -1,133 +1,123 @@
 package com.readutf.fedex;
 
-import com.readutf.fedex.interfaces.IncomingParcelListener;
-import com.readutf.fedex.interfaces.Parcel;
+import com.readutf.fedex.exception.ConnectionFailure;
+import com.readutf.fedex.parcels.Parcel;
+import com.readutf.fedex.utils.ClassUtils;
+import com.readutf.fedex.utils.UnsafeHandler;
 import lombok.Getter;
-
-import java.lang.reflect.Field;
-import java.lang.reflect.GenericArrayType;
-import java.util.*;
-import java.util.logging.Level;
-import java.util.logging.Logger;
-
 import lombok.Setter;
 import redis.clients.jedis.Jedis;
-import sun.misc.Unsafe;
+import redis.clients.jedis.JedisPool;
+import redis.clients.jedis.exceptions.JedisConnectionException;
+
+import java.util.ArrayList;
+import java.util.List;
+import java.util.UUID;
+import java.util.concurrent.ForkJoinPool;
+import java.util.logging.Level;
+import java.util.logging.Logger;
 
 @Getter
 public class FedEx {
 
-    private List<Class<?>> packetListeners = new ArrayList<>();
-    private HashMap<String, Parcel> registeredParcels = new HashMap<>();
-    private Thread redisThread;
+    UUID id;
 
-    private Jedis jedisSubscriber;
-    private Jedis jedisPublisher;
+    String address;
+    int port;
+    boolean auth;
+    String password;
+    String channel;
 
-    private String channel;
-    private Logger logger;
-
-    @Getter @Setter private static boolean debugMode = false;
-
-    private UUID id;
-
+    @Getter
     private static FedEx instance;
+    public static Logger LOGGER;
 
-    public FedEx(String address, int port, boolean auth, String password, String channel) {
+    @Getter
+    private static boolean redisDisconnected;
+    @Getter @Setter private static boolean debug = false;
+
+    private Thread jedisThread;
+
+    private FedExSubscriber fedExSubscriber;
+
+
+    private Jedis publisher;
+    private Jedis subscriber;
+    private Jedis dataHandle;
+
+
+    @Getter
+    List<Parcel> parcels;
+    Thread subscriberThread;
+
+    public FedEx(String address, int port, boolean auth, String password, String channel) throws ConnectionFailure {
         instance = this;
-        id = UUID.randomUUID();
-        this.logger = Logger.getLogger(getClass().getName());
-
-        jedisSubscriber = new Jedis(address, port);
-        jedisPublisher = new Jedis(address, port);
-
-        if(auth) {
-            jedisSubscriber.auth(password);
-            jedisPublisher.auth(password);
-        }
-
-        new Thread(new FedExThread(this)).start();
-
-
+        this.address = address;
+        this.port = port;
+        this.auth = auth;
         this.channel = channel;
+        this.password = password;
+        id = UUID.randomUUID();
+        LOGGER = Logger.getLogger(getClass().getName());
+        fedExSubscriber = new FedExSubscriber();
 
+        parcels = new ArrayList<>();
 
-    }
+        publisher = new Jedis(address, port);
+        subscriber = new Jedis(address, port);
+        dataHandle = new Jedis(address, port);
 
-    public boolean connect() {
         try {
-            jedisSubscriber.connect();
-            jedisPublisher.connect();
-        } catch (Exception e) {
-            return false;
+            jedisThread = new Thread(() -> ForkJoinPool.commonPool().execute(() -> subscriber.subscribe(fedExSubscriber, channel)));
+            jedisThread.start();
+        } catch (JedisConnectionException e) {
+            redisDisconnected = true;
+            throw new ConnectionFailure("Could not connect to host " + address + ":" + port);
         }
-
-        new FedExThread(this).run();
-        return true;
     }
 
     public void disconnect() {
-
-        redisThread.interrupt();
-
-        redisThread = null;
-        jedisPublisher.disconnect();
-        jedisPublisher.disconnect();
+        if(fedExSubscriber.isSubscribed()) fedExSubscriber.unsubscribe();
+        jedisThread.interrupt();
+        subscriber.quit();
+        publisher.quit();
     }
-
-    public static FedEx get() {return instance;}
-
 
     public void sendParcel(Parcel parcel) {
-        jedisPublisher.publish(channel, parcel.getName() +";" + parcel.toJson() + ";" + id.toString());
+        if (redisDisconnected) return;
+        publisher.publish(channel, parcel.getName() + ";" + parcel.toJson() + ";" + id.toString());
     }
 
-    public void registerParcelListener(Class<?> clazz) {
-
-        if(Arrays.stream(clazz.getMethods()).noneMatch(method -> method.isAnnotationPresent(IncomingParcelListener.class))) {
-            return;
-        }
-        packetListeners.add(clazz);
+    /*
+      @Param object is the main class
+     */
+    public void registerParcels(Object object) {
+        Class<?> clazz = object.getClass();
+        ClassUtils.getClassesInPackage(clazz, clazz.getPackage().getName()).stream().filter(Parcel.class::isAssignableFrom).forEach(this::registerParcel);
     }
 
-    public void registerParcel(Class<?> clazz)  {
-        if(clazz == null) return;
-        if(!clazz.getSuperclass().equals(Parcel.class)) {
+    public void registerParcel(Class<?> clazz) {
+        if (clazz == null) return;
+        if (!clazz.getSuperclass().equals(Parcel.class)) {
             return;
         }
-
-
-        Parcel parcel = null;
-        try {
-            parcel = (Parcel) unsafe.allocateInstance(clazz);
-        } catch (Exception e) {
-            e.printStackTrace();
-        }
-
-        if(parcel.getName().equalsIgnoreCase("") || parcel.getName() == null) {
-            logger.severe("[" + clazz.getName() + "] Invalid name.");
+        Parcel parcel = new UnsafeHandler<Parcel>(clazz).getInstance();
+        if (parcel == null || parcel.getName() == null || parcel.getName().equalsIgnoreCase("")) {
+            debug("[" + clazz.getName() + "] Invalid name.");
             return;
         }
-
-        FedEx.debug("registered parcel: " + parcel);
-        registeredParcels.put(parcel.getName(), parcel);
-
+        debug("registered parcel: " + parcel.getName());
+        if (parcels.stream().noneMatch(parcel1 -> parcel1.getName().equalsIgnoreCase(parcel.getName()))) {
+            parcels.add(parcel);
+        }
     }
 
     public static void debug(String message) {
-        if(!debugMode) return;
-        System.out.println(message);
+        if(debug) System.out.println(message);
     }
 
-    static Unsafe unsafe;
-    static {
-        try {
-            Field singleoneInstanceField = Unsafe.class.getDeclaredField("theUnsafe");
-            singleoneInstanceField.setAccessible(true);
-            unsafe = (Unsafe) singleoneInstanceField.get(null);
-        } catch (Exception e) {
-            e.printStackTrace();
-        }
+    public static Jedis getResource() {
+        return getInstance().dataHandle;
     }
 
 }
